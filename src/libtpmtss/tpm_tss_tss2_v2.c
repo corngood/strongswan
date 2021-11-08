@@ -3,6 +3,8 @@
  * Copyright (C) 2018-2020 Andreas Steffen
  * HSR Hochschule fuer Technik Rapperswil
  *
+ * Copyright (C) 2021 Andreas Steffen, strongSec GmbH
+ *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
  * Free Software Foundation; either version 2 of the License, or (at your
@@ -1214,13 +1216,182 @@ METHOD(tpm_tss_t, sign, bool,
 	return TRUE;
 }
 
+static bool start_auth_session(private_tpm_tss_tss2_t *this, uint32_t ek_handle)
+{
+	uint32_t rval;
+	size_t hash_len;
+
+	TPMI_DH_ENTITY bind = TPM2_RH_NULL;
+	TPM2B_PUBLIC public = { 0, };
+	TPM2B_NONCE nonceCaller = { 16, };
+	TPM2B_ENCRYPTED_SECRET encryptedSalt;
+	TPM2_SE sessionType = TPM2_SE_HMAC;
+	TPMT_SYM_DEF symmetric = { .algorithm = TPM2_ALG_AES,
+		                       .keyBits.sym = 256,
+		                       .mode.sym = TPM2_ALG_CFB };
+	TPMI_ALG_HASH authHash = TPM2_ALG_SHA256;
+	TPMI_SH_AUTH_SESSION sessionHandle;
+	TPM2B_NONCE nonceTPM;
+
+	TSS2L_SYS_AUTH_COMMAND  auth_cmd = { 1, { auth_cmd_empty } };
+	TSS2L_SYS_AUTH_RESPONSE auth_rsp;
+
+
+	if (!read_public(this, ek_handle, &public))
+	{
+		return FALSE;
+	}
+
+	/* Determine key hash size */
+	switch (public.publicArea.nameAlg)
+	{
+		case TPM2_ALG_SHA1:
+			hash_len = TPM2_SHA1_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA256:
+		case TPM2_ALG_SHA3_256:
+			hash_len = TPM2_SHA256_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA384:
+		case TPM2_ALG_SHA3_384:
+			hash_len = TPM2_SHA384_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA512:
+		case TPM2_ALG_SHA3_512:
+			hash_len = TPM2_SHA512_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SM3_256:
+			hash_len = TPM2_SM3_256_DIGEST_SIZE;
+			break;
+		default:
+			DBG1(DBG_PTS, "%s unsupported key hash algorithm", LABEL);
+			return FALSE;
+	}
+
+	switch (public.publicArea.type)
+	{
+		case TPM2_ALG_RSA:
+		{
+			encryption_scheme_t encryption_scheme;
+			nonce_gen_t *ng;
+			bool success;
+
+			TPM2B_NONCE salt;
+
+			DBG2(DBG_PTS, "%s EK RSA handle: 0x%08x with hash len of %u bytes",
+				 LABEL, ek_handle, hash_len);
+
+			ng = lib->crypto->create_nonce_gen(lib->crypto);
+			if (!ng)
+			{
+				return FALSE;
+			}
+
+			success = ng->get_nonce(ng, hash_len, salt.buffer);
+			ng->destroy(ng);
+			if (!success)
+			{
+				return FALSE;
+			}
+
+			/**
+			 * When encrypting salts, the encryption scheme of a key is ignored
+			 * and TPM2_ALG_OAEP is always used.
+			 */
+			public.publicArea.parameters.rsaDetail.scheme.scheme = TPM2_ALG_OAEP;
+
+			switch (public.publicArea.nameAlg)
+			{
+				case TPM2_ALG_SHA1:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA1;
+					break;
+				case TPM2_ALG_SHA256:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA256;
+					break;
+				case TPM2_ALG_SHA384:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA384;
+					break;
+				case TPM2_ALG_SHA512:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA512;
+					break;
+				default:
+					DBG1(DBG_PTS, "%s unsupported key hash algorithm", LABEL);
+					return FALSE;
+			}
+
+			/* r = iesys_crypto_pk_encrypt(&pub,
+                                    keyHash_size, &esys_context->salt.buffer[0],
+                                    sizeof(TPMU_ENCRYPTED_SECRET),
+                                    (BYTE *) &encryptedSalt->secret[0], &cSize,
+                                    "SECRET");
+			return_if_error(r, "During encryption.");
+			LOGBLOB_DEBUG(&encryptedSalt->secret[0], cSize, "IESYS encrypted salt");
+			encryptedSalt->size = cSize;
+			*/
+			break;
+		}
+		case TPM2_ALG_ECC:
+			DBG2(DBG_PTS, "%s EK ECC handle: 0x%08x with hash len of %u bytes", LABEL, ek_handle, hash_len);
+			/* r = iesys_crypto_get_ecdh_point(&pub, sizeof(TPMU_ENCRYPTED_SECRET),
+                                        &Z, &Q,
+                                        (BYTE *) &encryptedSalt->secret[0],
+                                       &cSize);
+			return_if_error(r, "During computation of ECC public key.");
+			encryptedSalt->size = cSize;
+			*/
+			/* Compute salt from Z with KDFe */
+			/*
+			r = iesys_crypto_KDFe(tpmKeyNode->rsrc.misc.
+                              rsrc_key_pub.publicArea.nameAlg,
+                              &Z, "SECRET", &Q.x,
+                              &pub.publicArea.unique.ecc.x,
+                              keyHash_size*8,
+                              &esys_context->salt.buffer[0]);
+			return_if_error(r, "During KDFe computation.");
+			esys_context->salt.size = keyHash_size;
+			 */
+			break;
+		default:
+			DBG1(DBG_PTS, "%s unsupported key type", LABEL);
+			return FALSE;
+	}
+
+	this->mutex->lock(this->mutex);
+	rval = Tss2_Sys_StartAuthSession(this->sys_context, ek_handle, bind,
+				&auth_cmd, &nonceCaller, &encryptedSalt, sessionType,
+				&symmetric, authHash, &sessionHandle, &nonceTPM, &auth_rsp);
+	this->mutex->unlock(this->mutex);
+	if (rval != TSS2_RC_SUCCESS)
+	{
+		DBG1(DBG_PTS,"%s Tss2_Sys_StartAuthSession failed: 0x%06x", LABEL, rval);
+    }
+
+    return TRUE;
+}
+
 METHOD(tpm_tss_t, get_random, bool,
 	private_tpm_tss_tss2_t *this, size_t bytes, uint8_t *buffer)
 {
-	size_t len, random_len= sizeof(TPM2B_DIGEST)-2;
+	size_t len, random_len = sizeof(TPM2B_DIGEST)-2;
 	TPM2B_DIGEST random = { random_len, };
 	uint8_t *pos = buffer;
-	uint32_t rval;
+	uint32_t rval, ek_handle = 0;
+	char *handle_str;
+	chunk_t handle_chunk;
+
+	/* Get EK ECC handle from settings */
+	handle_str = lib->settings->get_str(lib->settings,
+								"%s.plugins.tpm.ek_handle", NULL, lib->ns);
+	if (handle_str)
+	{
+		handle_chunk = chunk_from_hex(chunk_from_str(handle_str),
+									 (char *)&ek_handle);
+		ek_handle = (handle_chunk.len == 4) ? htonl(ek_handle) : 0;
+		if (ek_handle)
+		{
+			start_auth_session(this, ek_handle);
+		}
+	}
 
 	while (bytes > 0)
 	{
