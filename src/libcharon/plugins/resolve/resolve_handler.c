@@ -60,6 +60,8 @@ struct private_resolve_handler_t {
 	 */
 	char *iface_prefix;
 
+	char *search_domain;
+
 	/**
 	 * Mutex to access file exclusively
 	 */
@@ -210,6 +212,8 @@ static bool invoke_resolvconf(private_resolve_handler_t *this, host_t *addr,
 		if (shell)
 		{
 			DBG1(DBG_IKE, "installing DNS server %H via resolvconf", addr);
+			if (this->search_domain)
+				fprintf(shell, "search %s\n", this->search_domain);
 			fprintf(shell, "nameserver %H\n", addr);
 			fclose(shell);
 		}
@@ -498,6 +502,9 @@ resolve_handler_t *resolve_handler_create()
 		this->iface_prefix = lib->settings->get_str(lib->settings,
 								"%s.plugins.resolve.resolvconf.iface_prefix",
 								RESOLVCONF_PREFIX, lib->ns);
+		this->search_domain = lib->settings->get_str(lib->settings,
+								"%s.plugins.resolve.resolvconf.search_domain",
+								NULL, lib->ns);
 	}
 
 	return &this->public;
