@@ -48,6 +48,8 @@ struct private_resolve_handler_t {
 	 */
 	char *file;
 
+	char *exec;
+
 	/**
 	 * Use resolvconf instead of writing directly to resolv.conf
 	 */
@@ -195,7 +197,7 @@ static bool invoke_resolvconf(private_resolve_handler_t *this, host_t *addr,
 	/* we use the nameserver's IP address as part of the interface name to
 	 * make them unique */
 	process = process_start_shell(NULL, install ? &in : NULL, &out, NULL,
-							"2>&1 %s %s %s%H", RESOLVCONF_EXEC,
+							"2>&1 %s %s %s%H", this->exec,
 							install ? "-a" : "-d", this->iface_prefix, addr);
 
 	if (!process)
@@ -486,7 +488,11 @@ resolve_handler_t *resolve_handler_create()
 									   RESOLV_CONF, lib->ns),
 	);
 
-	if (stat(RESOLVCONF_EXEC, &st) == 0)
+	this->exec = lib->settings->get_str(lib->settings,
+										"%s.plugins.resolve.resolvconf.exec",
+										RESOLVCONF_EXEC, lib->ns);
+
+	if (stat(this->exec, &st) == 0)
 	{
 		this->use_resolvconf = TRUE;
 		this->iface_prefix = lib->settings->get_str(lib->settings,
